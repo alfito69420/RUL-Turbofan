@@ -1,9 +1,12 @@
-
-#   Librerías 
+# Librerías
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import xgboost as xg
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+
 plt.style.use('bmh')
 sns.set_style("whitegrid")
 
@@ -11,101 +14,127 @@ import os
 os.environ['TCL_LIBRARY'] = 'C:/Users/Alfres/AppData/Local/Programs/Python/Python313/tcl/tcl8.6'
 os.environ['TK_LIBRARY'] = 'C:/Users/Alfres/AppData/Local/Programs/Python/Python313/tcl/tk8.6'
 
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, r2_score
+# Set de opciones de pandas
 pd.set_option("display.max_rows", None)
 
-# se define el nombre de las columnas
+# Inicializamos el escalador
+sc = StandardScaler()
+
+# Se define el nombre de las columnas
 index_names = ['motor', 'ciclos_operacion']
-setting_names = ['setting_1', 'setting_2', 'setting_3']
+setting_names = ['configuracion_1', 'configuracion_2', 'configuracion_3']
 sensor_names = ['sensor_{}'.format(i) for i in range(1,22)] 
 col_names = index_names + setting_names + sensor_names
 
-#se cargan los datos
-train = pd.read_csv('CMAPSSData\\train_FD001.txt',sep='\\s+', header=None, names=col_names)
-test = pd.read_csv('CMAPSSData\\train_FD001.txt',sep='\\s+', header=None, names=col_names)
+# Se cargan los datos
+train = pd.read_csv('CMAPSSData\\train_FD001.txt', sep='\\s+', header=None, names=col_names)
+test = pd.read_csv('CMAPSSData\\train_FD001.txt', sep='\\s+', header=None, names=col_names)
 y_test = pd.read_csv('CMAPSSData\\RUL_FD001.txt', sep='\\s+', header=None, names=['RUL'])
 
-# El archivo train contiene todas las caracteristicas como numero de unidad, parametros de configuracion y sensores
-# El archivo test contiene todas las caracteristicas como numero de unidad, parametros de configuracion y sensores
-# El archivo Y_test contiene el RUL para los datos de test
-train.head()
+# CORRECCIONES: Filtrar test para que coincida con los motores en y_test
+# Agrega un índice de motor al DataFrame y_test para alinear los datos
+y_test['motor'] = range(1, 101)  # Motores del 1 al 100
+test = test[test['motor'].isin(y_test['motor'])]
 
-train_head = train  # Usa el DataFrame completo
-train_head.to_csv('C:\\Users\\Alfres\\Desktop\\RULtrain_output.csv', sep='\t', index=False)
+# Asegúrate de que test esté ordenado igual que y_test
+test = test.sort_values(by='motor')
+y_test = y_test.sort_values(by='motor')
 
-print(train.head())
-
-
-train['motor'].unique() # Hay 100 motores no unicos
-y_test.shape    # RUL value for 100 no of engines 
-(100,1)
-print(train.describe())
-
-train=train.drop('setting_3',axis=1)
-
+# Función para agregar RUL al conjunto de datos
 def add_remaining_useful_life(df):
-    #   Obten el numero total de ciclos por cada unidad
     grouped_by_unit = df.groupby(by="motor")
     max_cycle = grouped_by_unit["ciclos_operacion"].max()
-    
-    #   Fusionar el ciclo máximo nuevamente en el marco original
     result_frame = df.merge(max_cycle.to_frame(name='max_cycle'), left_on='motor', right_index=True)
-    
-    #   Calcula el RULL de cada fila
     remaining_useful_life = result_frame["max_cycle"] - result_frame["ciclos_operacion"]
     result_frame["RUL"] = remaining_useful_life
-    
-    #Se elimina max_cycle, ya no se ocupa
     result_frame = result_frame.drop("max_cycle", axis=1)
     return result_frame
 
+# Calculamos el RUL para el conjunto de entrenamiento
 train = add_remaining_useful_life(train)
-train[sensor_names+['RUL']].head()
+train[sensor_names + ['RUL']].head()
 
+# Histograma de RUL para los motores
 df_max_rul = train[['motor', 'RUL']].groupby('motor').max().reset_index()
 df_max_rul['RUL'].hist(bins=15, figsize=(15,7))
 plt.xlabel('RUL')
-plt.ylabel('frequency')
+plt.ylabel('Motores')
 plt.show()
 
+# Función para graficar sensores
 def plot_sensor(sensor_name):
-    plt.figure(figsize=(13,5))
+    plt.figure(figsize=(13, 5))
     for i in train['motor'].unique():
-        if (i % 10 == 0):  
-            plt.plot('RUL', sensor_name, 
-                    data=train[train['motor']==i])
+        if (i % 10 == 0):  # Selecciona motores divisibles por 10
+            plt.plot('RUL', sensor_name, data=train[train['motor'] == i], label=f'Motor {i}')
     plt.xlim(250, 0)  
     plt.xticks(np.arange(0, 275, 25))
     plt.ylabel(sensor_name)
-    plt.xlabel('Remaining Use fulLife')
+    plt.xlabel('Remaining Useful Life')
+    plt.legend(loc='best')
+    plt.title(f'Sensor: {sensor_name}')
     plt.show()
 
+# Generar gráficos para cada sensor
 for sensor_name in sensor_names:
     plot_sensor(sensor_name)
-    
-plt.figure(figsize=(25,18))
-sns.heatmap(train.corr(),annot=True ,cmap='Reds')
-plt.show()
 
-cor=train.corr()
-#Selecting highly correlated features
-train_relevant_features = cor[abs(cor['RUL'])>=0.5]
+# Correlación entre variables
+cor = train.corr()
+train_relevant_features = cor[abs(cor['RUL']) >= 0.5]
 train_relevant_features['RUL']
 
-list_relevant_features=train_relevant_features.index
-list_relevant_features=list_relevant_features[1:]
-list_relevant_features
+list_relevant_features = train_relevant_features.index
+list_relevant_features = list_relevant_features[1:]  # Eliminamos la columna 'RUL' de la lista de características
+train = train[list_relevant_features]
 
-# Now we will keep onlt these imprtant features in both train & test dataset.
-train=train[list_relevant_features]
+# División en X_train y y_train
+y_train = train['RUL']
+X_train = train.drop(['RUL'], axis=1)
 
-# train & y_train
-# Calculated RUL variable is our Target variable.
-y_train=train['RUL']
-X_train=train.drop(['RUL'],axis=1)
-X_train.head(5)
+# Filtrar y preparar datos de test
+X_test = test[X_train.columns]  # Usar las mismas características seleccionadas en X_train
 
-# Test data set , keeping only train columns/features.
-X_test=test[X_train.columns]
-X_test.head(5)
+# Calcular el RUL para el conjunto de test
+test = add_remaining_useful_life(test)
+y_test = test[['motor', 'RUL']]  # Tomamos la columna de RUL calculada en test
+
+# Asegúrate de que test y y_test estén alineados
+y_test = y_test.sort_values(by='motor')
+test = test.sort_values(by='motor')
+
+# Escalar los datos
+X_train1 = sc.fit_transform(X_train)
+X_test1 = sc.transform(X_test)
+
+# Función para evaluar el modelo
+def evaluate(y_true, y_hat, label='test'):
+    mse = mean_squared_error(y_true, y_hat)
+    rmse = np.sqrt(mse)
+    variance = r2_score(y_true, y_hat)
+    print('{} set RMSE: {}, R2: {}'.format(label, rmse, variance))
+    return rmse, variance
+
+# Modelo XGBoost
+xgb_r = xg.XGBRegressor(objective='reg:linear', n_estimators=10, seed=123)
+xgb_r.fit(X_train1, y_train)
+
+# Evaluar en el conjunto de entrenamiento
+y_hat_train1 = xgb_r.predict(X_train1)
+RMSE_Train, R2_Train = evaluate(y_train, y_hat_train1, 'train')
+
+# Evaluar en el conjunto de prueba
+y_hat_test1 = xgb_r.predict(X_test1)
+RMSE_Test, R2_Test = evaluate(y_test['RUL'], y_hat_test1)
+
+# Resultados finales
+Results = pd.DataFrame({
+    'Model': ['XGBoost'],
+    'RMSE-Train': [RMSE_Train],
+    'R2-Train': [R2_Train],
+    'RMSE-Test': [RMSE_Test],
+    'R2-Test': [R2_Test]
+})
+
+print(Results)
+Results
